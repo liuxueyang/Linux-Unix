@@ -1,15 +1,17 @@
 /*
  * =====================================================================================
- *       Filename : menu1.c
- *    Description : menu choice
- *    Version     : 0.1
- *        Created : 04/06/14 12:03
+ *       Filename : menu3.c
+ *    Description : redirect some output to terminal while others to file
+ *    Version     : 0.3
+ *        Created : 04/06/14 16:11
  *         Author : Liu Xue Yang (LXY), liuxueyang457@163.com
  *         Motto  : How about today?
  * =====================================================================================
  */
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 char *menu[] = {
 	"a - add new record",
 	"d - delete record",
@@ -24,7 +26,7 @@ char *menu[] = {
  * =====================================================================================
  */
 	int
-getchoice ( char *greet, char * choices[] )
+getchoice ( char *greet, char * choices[], FILE *in, FILE *out )
 {
 	int chosen = 0;
 	int selected;
@@ -32,14 +34,14 @@ getchoice ( char *greet, char * choices[] )
 
 	do
 	{
-		printf ( "Choice: %s\n", greet );
+		fprintf ( out, "Choice: %s\n", greet );
 		option = choices;
 		while ( *option ) {
-			printf ( "%s\n", *option );
+			fprintf ( out, "%s\n", *option );
 			++option;
 		}
 		do {
-			selected = getchar();
+			selected = fgetc(in);
 		} while ( '\n' == selected );				/* -----  end do-while  ----- */
 		option = choices;
 		while ( *option ) {
@@ -50,7 +52,7 @@ getchoice ( char *greet, char * choices[] )
 			++option;
 		}
 		if ( !chosen ) {
-			printf ( "Incorrect choice, select again\n" );
+			fprintf ( out, "Incorrect choice, select again\n" );
 		} 
 	} while (!chosen);
 	return selected;
@@ -66,12 +68,25 @@ getchoice ( char *greet, char * choices[] )
 main ( int argc, char *argv[] )
 {
 	int choice = 0;
+	FILE *in, *out;
 
+	if ( !isatty(fileno(stdout)) ) {
+		fprintf(stderr, "You are not a terminal!\n");
+//		exit(1);
+	}
+	in = fopen("/dev/tty", "r");
+	out = fopen("/dev/tty", "w");
+	if ( !in || !out ) {
+		fprintf(stderr, "Unable to open /dev/tty\n");
+		exit(1);
+	}
 	do
 	{
-		choice = getchoice("Please select an action", menu);
+		choice = getchoice("Please select an action", menu, in, out);
 		printf ( "You have chosen: %c\n", choice );
 	} while (choice != 'q');
 
 		return EXIT_SUCCESS;
-}				/* ----------  end of function main  ---------- */
+}
+
+

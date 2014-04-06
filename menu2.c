@@ -1,15 +1,16 @@
 /*
  * =====================================================================================
- *       Filename : menu1.c
- *    Description : menu choice
- *    Version     : 0.1
- *        Created : 04/06/14 12:03
+ *       Filename : menu2.c
+ *    Description : check whether there is a redirection
+ *    Version     : 0.2
+ *        Created : 04/06/14 15:52
  *         Author : Liu Xue Yang (LXY), liuxueyang457@163.com
  *         Motto  : How about today?
  * =====================================================================================
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 char *menu[] = {
 	"a - add new record",
 	"d - delete record",
@@ -67,6 +68,10 @@ main ( int argc, char *argv[] )
 {
 	int choice = 0;
 
+	if ( !isatty(fileno(stdout)) ) {
+		fprintf(stderr, "You are not a terminal!\n");
+		exit(1);
+	}
 	do
 	{
 		choice = getchoice("Please select an action", menu);
@@ -74,4 +79,5 @@ main ( int argc, char *argv[] )
 	} while (choice != 'q');
 
 		return EXIT_SUCCESS;
-}				/* ----------  end of function main  ---------- */
+}
+

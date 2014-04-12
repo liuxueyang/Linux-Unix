@@ -1,0 +1,25 @@
+#!/bin/bash - 
+#===============================================================================
+#
+#          FILE: push.sh
+# 
+#         USAGE: ./push.sh 
+# 
+#   DESCRIPTION: 
+# 
+#       OPTIONS: ---
+#  REQUIREMENTS: ---
+#          BUGS: ---
+#         NOTES: ---
+#        AUTHOR: liuxueyang (lxy), liuxueyang457@163.com
+#  ORGANIZATION: Hunan University
+#       CREATED: 04/12/2014 10:40
+#      REVISION:  ---
+#===============================================================================
+
+set -o nounset                              # Treat unset variables as an error
+
+git add --all 
+git commit -m 'add or modify'
+git push origin master
+

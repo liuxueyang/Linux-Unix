@@ -24,7 +24,6 @@ main ( int argc, char *argv[] )
 {
 //	char computer[256];
 	struct utsname uts;
-
 //	if ( gethostname(computer, 256) != 0 || uname(&uts) != -1 ) {
 //		fprintf(stderr, "Could not get host information");
 //		exit(1);

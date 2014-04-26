@@ -51,7 +51,7 @@ getchoice ( char *greet, char * choices[] )
 			++option;
 		}
 		if ( !chosen ) {
-			printf ( "Incorrect choice, select again\n" );
+			printf ( "\nIncorrect choice, select again\n" );
 		} 
 	} while (!chosen);
 	return selected;
@@ -75,7 +75,7 @@ main ( int argc, char *argv[] )
 	do
 	{
 		choice = getchoice("Please select an action", menu);
-		printf ( "You have chosen: %c\n", choice );
+		printf ( "\nYou have chosen: %c\n", choice );
 	} while (choice != 'q');
 
 		return EXIT_SUCCESS;

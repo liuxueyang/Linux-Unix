@@ -1,0 +1,717 @@
+ Documentation/Configure.help |    2 
+ drivers/ide/ide-disk.c       |   24 +++
+ fs/Config.in                 |    1 
+ fs/Makefile                  |    4 
+ fs/buffer.c                  |   38 +++++
+ fs/jbd-kernel.c              |  290 +++++++++++++++++++++++++++++++++++++++++++
+ include/linux/buffer-trace.h |   84 ++++++++++++
+ include/linux/fs.h           |    9 +
+ include/linux/jbd.h          |   11 -
+ 9 files changed, 452 insertions(+), 11 deletions(-)
+
+diff -puN Documentation/Configure.help~ext3-debug Documentation/Configure.help
+--- 24/Documentation/Configure.help~ext3-debug	2003-05-14 13:38:14.000000000 -0700
++++ 24-akpm/Documentation/Configure.help	2003-05-14 13:38:14.000000000 -0700
+@@ -15283,7 +15283,7 @@ CONFIG_EXT2_FS
+ 
+ Ext3 journalling file system support (EXPERIMENTAL)
+ CONFIG_EXT3_FS
+-  This is the journalling version of the Second extended file system
++  This is the journaling version of the Second extended file system
+   (often called ext3), the de facto standard Linux file system
+   (method to organize files on a storage device) for hard disks.
+ 
+diff -puN drivers/ide/ide-disk.c~ext3-debug drivers/ide/ide-disk.c
+--- 24/drivers/ide/ide-disk.c~ext3-debug	2003-05-14 13:38:14.000000000 -0700
++++ 24-akpm/drivers/ide/ide-disk.c	2003-05-14 13:38:14.000000000 -0700
+@@ -367,6 +367,30 @@ static ide_startstop_t do_rw_disk (ide_d
+ 
+ 	nsectors.all		= (u16) rq->nr_sectors;
+ 
++#ifdef CONFIG_JBD_DEBUG
++{
++	/*
++	 * Silently stop writing to this disk to simulate a crash.
++	 */
++	extern int journal_no_write[2];
++	int i;
++
++	if (rq->cmd != WRITE)
++		goto write_ok;
++
++	for (i = 0; i < 2; i++) {
++		if ((journal_no_write[i] & 0xdead0000) == 0xdead0000) {
++			if (rq->rq_dev == (journal_no_write[i] & 0xffff)) {
++				ide_end_request(1, HWGROUP(drive));
++				return ide_stopped;
++			}
++		}
++	}
++}
++write_ok:
++	;
++#endif
++
+ 	if (driver_blocked)
+ 		panic("Request while ide driver is blocked?");
+ 
+diff -puN fs/buffer.c~ext3-debug fs/buffer.c
+--- 24/fs/buffer.c~ext3-debug	2003-05-14 13:38:14.000000000 -0700
++++ 24-akpm/fs/buffer.c	2003-05-14 13:38:14.000000000 -0700
+@@ -45,6 +45,7 @@
+ #include <linux/quotaops.h>
+ #include <linux/iobuf.h>
+ #include <linux/highmem.h>
++#include <linux/jbd.h>
+ #include <linux/module.h>
+ #include <linux/completion.h>
+ 
+@@ -735,6 +736,7 @@ void init_buffer(struct buffer_head *bh,
+ 	bh->b_list = BUF_CLEAN;
+ 	bh->b_end_io = handler;
+ 	bh->b_private = private;
++	buffer_trace_init(&bh->b_history);
+ }
+ 
+ static void end_buffer_io_async(struct buffer_head * bh, int uptodate)
+@@ -745,6 +747,7 @@ static void end_buffer_io_async(struct b
+ 	struct page *page;
+ 	int fullup = 1;
+ 
++	BUFFER_TRACE(bh, "enter");
+ 	mark_buffer_uptodate(bh, uptodate);
+ 
+ 	/* This is a temporary buffer used for page I/O. */
+@@ -1062,6 +1065,9 @@ EXPORT_SYMBOL(set_buffer_flushtime);
+ static void __refile_buffer(struct buffer_head *bh)
+ {
+ 	int dispose = BUF_CLEAN;
++
++	BUFFER_TRACE(bh, "enter");
++
+ 	if (buffer_locked(bh))
+ 		dispose = BUF_LOCKED;
+ 	if (buffer_dirty(bh))
+@@ -1073,6 +1079,7 @@ static void __refile_buffer(struct buffe
+ 			remove_inode_queue(bh);
+ 		__insert_into_lru_list(bh, dispose);
+ 	}
++	BUFFER_TRACE(bh, "exit");
+ }
+ 
+ void refile_buffer(struct buffer_head *bh)
+@@ -1087,6 +1094,7 @@ void refile_buffer(struct buffer_head *b
+  */
+ void __brelse(struct buffer_head * buf)
+ {
++	BUFFER_TRACE(buf, "entry");
+ 	if (atomic_read(&buf->b_count)) {
+ 		put_bh(buf);
+ 		return;
+@@ -1100,6 +1108,7 @@ void __brelse(struct buffer_head * buf)
+  */
+ void __bforget(struct buffer_head * buf)
+ {
++	BUFFER_TRACE(buf, "enter");
+ 	mark_buffer_clean(buf);
+ 	__brelse(buf);
+ }
+@@ -1134,6 +1143,18 @@ static void __put_unused_buffer_head(str
+ {
+ 	if (unlikely(buffer_attached(bh)))
+ 		BUG();
++
++	J_ASSERT_BH(bh, bh->b_prev_free == 0);
++#if defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE)
++	if (buffer_jbd(bh)) {
++		J_ASSERT_BH(bh, bh2jh(bh)->b_transaction == 0);
++		J_ASSERT_BH(bh, bh2jh(bh)->b_next_transaction == 0);
++		J_ASSERT_BH(bh, bh2jh(bh)->b_frozen_data == 0);
++		J_ASSERT_BH(bh, bh2jh(bh)->b_committed_data == 0);
++	}
++#endif
++	buffer_trace_init(&bh->b_history);
++
+ 	if (nr_unused_buffer_heads >= MAX_UNUSED_BUFFERS) {
+ 		kmem_cache_free(bh_cachep, bh);
+ 	} else {
+@@ -1181,6 +1202,7 @@ struct buffer_head * get_unused_buffer_h
+ 	if((bh = kmem_cache_alloc(bh_cachep, SLAB_NOFS)) != NULL) {
+ 		bh->b_blocknr = -1;
+ 		bh->b_this_page = NULL;
++		buffer_trace_init(&bh->b_history);
+ 		return bh;
+ 	}
+ 
+@@ -1194,6 +1216,7 @@ struct buffer_head * get_unused_buffer_h
+ 			unused_list = bh->b_next_free;
+ 			nr_unused_buffer_heads--;
+ 			spin_unlock(&unused_list_lock);
++			buffer_trace_init(&bh->b_history);
+ 			return bh;
+ 		}
+ 		spin_unlock(&unused_list_lock);
+@@ -1298,6 +1321,7 @@ no_grow:
+ static void discard_buffer(struct buffer_head * bh)
+ {
+ 	if (buffer_mapped(bh)) {
++		BUFFER_TRACE(bh, "entry");
+ 		mark_buffer_clean(bh);
+ 		lock_buffer(bh);
+ 		clear_bit(BH_Uptodate, &bh->b_state);
+@@ -1424,7 +1448,10 @@ static void unmap_underlying_metadata(st
+ 	struct buffer_head *old_bh;
+ 
+ 	old_bh = get_hash_table(bh->b_dev, bh->b_blocknr, bh->b_size);
++	J_ASSERT_BH(bh, old_bh != bh);
+ 	if (old_bh) {
++		BUFFER_TRACE(old_bh, "old_bh - entry");
++		J_ASSERT_BH(old_bh, !buffer_jlist_eq(old_bh, BJ_Metadata));
+ 		mark_buffer_clean(old_bh);
+ 		wait_on_buffer(old_bh);
+ 		clear_bit(BH_Req, &old_bh->b_state);
+@@ -1481,8 +1508,10 @@ static int __block_write_full_page(struc
+ 			err = get_block(inode, block, bh, 1);
+ 			if (err)
+ 				goto out;
+-			if (buffer_new(bh))
++			if (buffer_new(bh)) {
++				BUFFER_TRACE(bh, "new: call unmap_underlying_metadata");
+ 				unmap_underlying_metadata(bh);
++			}
+ 		}
+ 		bh = bh->b_this_page;
+ 		block++;
+@@ -1490,6 +1519,7 @@ static int __block_write_full_page(struc
+ 
+ 	/* Stage 2: lock the buffers, mark them clean */
+ 	do {
++		BUFFER_TRACE(bh, "lock it");
+ 		lock_buffer(bh);
+ 		set_buffer_async_io(bh);
+ 		set_bit(BH_Uptodate, &bh->b_state);
+@@ -1573,8 +1603,10 @@ static int __block_prepare_write(struct 
+ 			if (err)
+ 				goto out;
+ 			if (buffer_new(bh)) {
++				BUFFER_TRACE(bh, "new: call unmap_underlying_metadata");
+ 				unmap_underlying_metadata(bh);
+ 				if (Page_Uptodate(page)) {
++					BUFFER_TRACE(bh, "setting uptodate");
+ 					set_bit(BH_Uptodate, &bh->b_state);
+ 					continue;
+ 				}
+@@ -1588,11 +1620,13 @@ static int __block_prepare_write(struct 
+ 			}
+ 		}
+ 		if (Page_Uptodate(page)) {
++			BUFFER_TRACE(bh, "setting uptodate");
+ 			set_bit(BH_Uptodate, &bh->b_state);
+ 			continue; 
+ 		}
+ 		if (!buffer_uptodate(bh) &&
+ 		     (block_start < from || block_end > to)) {
++			BUFFER_TRACE(bh, "reading");
+ 			ll_rw_block(READ, 1, &bh);
+ 			*wait_bh++=bh;
+ 		}
+@@ -1665,6 +1699,7 @@ static int __block_commit_write(struct i
+ 		} else {
+ 			set_bit(BH_Uptodate, &bh->b_state);
+ 			if (!atomic_set_buffer_dirty(bh)) {
++				BUFFER_TRACE(bh, "mark dirty");
+ 				__mark_dirty(bh);
+ 				buffer_insert_inode_data_queue(bh, inode);
+ 				need_balance_dirty = 1;
+@@ -1999,6 +2034,7 @@ int block_truncate_page(struct address_s
+ 	flush_dcache_page(page);
+ 	kunmap(page);
+ 
++	BUFFER_TRACE(bh, "zeroed end of block");
+ 	if (!atomic_set_buffer_dirty(bh)) {
+ 		__mark_dirty(bh);
+ 		buffer_insert_inode_data_queue(bh, inode);
+diff -puN fs/Config.in~ext3-debug fs/Config.in
+--- 24/fs/Config.in~ext3-debug	2003-05-14 13:38:14.000000000 -0700
++++ 24-akpm/fs/Config.in	2003-05-14 13:38:14.000000000 -0700
+@@ -30,6 +30,7 @@ tristate 'Ext3 journalling file system s
+ # dep_tristate '  Journal Block Device support (JBD for ext3)' CONFIG_JBD $CONFIG_EXT3_FS
+ define_bool CONFIG_JBD $CONFIG_EXT3_FS
+ dep_mbool '  JBD (ext3) debugging support' CONFIG_JBD_DEBUG $CONFIG_JBD
++bool 'Buffer Head tracing (DEBUG)' CONFIG_BUFFER_DEBUG
+ 
+ # msdos file systems
+ tristate 'DOS FAT fs support' CONFIG_FAT_FS
+diff -puN /dev/null fs/jbd-kernel.c
+--- /dev/null	2002-08-30 16:31:37.000000000 -0700
++++ 24-akpm/fs/jbd-kernel.c	2003-05-14 13:38:14.000000000 -0700
+@@ -0,0 +1,290 @@
++/*
++ * fs/jbd-kernel.c
++ *
++ * Support code for the Journalling Block Device layer.
++ * This file contains things which have to be in-kernel when
++ * JBD is a module.
++ *
++ * 15 May 2001	Andrew Morton <andrewm@uow.edu.au>
++ *	Created
++ */
++
++#include <linux/config.h>
++#include <linux/fs.h>
++#include <linux/jbd.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++
++#if defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE)
++
++#ifdef CONFIG_JBD_DEBUG
++/*
++ * Some sanity testing which is called from mark_buffer_clean(),
++ * and must be present in the main kernel.
++ */
++
++void jbd_preclean_buffer_check(struct buffer_head *bh)
++{
++	if (buffer_jbd(bh)) {
++		struct journal_head *jh = bh2jh(bh);
++
++		transaction_t *transaction = jh->b_transaction;
++		journal_t *journal;
++
++		if (jh->b_jlist == 0 && transaction == NULL)
++			return;
++
++		J_ASSERT_JH(jh, (jh->b_jlist == 0 ||
++				 jh->b_jlist == BJ_LogCtl ||
++				 jh->b_jlist == BJ_IO ||
++				 jh->b_jlist == BJ_Forget ||
++				 buffer_jbd_data(bh)));
++		J_ASSERT_JH(jh, transaction != NULL);
++		/* The kernel may be unmapping old data.  We expect it
++		 * to be dirty in that case, unless the buffer has
++		 * already been forgotten by a transaction. */
++		if (jh->b_jlist != BJ_Forget) {
++#if 1
++			if (!buffer_dirty(bh)) {
++				printk(__FUNCTION__": clean of clean buffer\n");
++				print_buffer_trace(bh);
++				return;
++			}
++#endif
++			J_ASSERT_BH(bh, buffer_dirty(bh));
++			if (!buffer_jbd_data(bh)) {
++				J_ASSERT_JH(jh,
++					    test_bit(BH_JWrite, 
++						     &jh2bh(jh)->b_state));
++			}
++		}
++		
++		journal = transaction->t_journal;
++		J_ASSERT_JH(jh,
++			    transaction == journal->j_running_transaction ||
++			    transaction == journal->j_committing_transaction);
++	}
++}
++EXPORT_SYMBOL(jbd_preclean_buffer_check);
++#endif		/* CONFIG_JBD_DEBUG */
++
++#endif	/* defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE) */
++
++/*
++ * Support functions for BUFFER_TRACE()
++ */
++#ifdef CONFIG_BUFFER_DEBUG
++
++static spinlock_t trace_lock = SPIN_LOCK_UNLOCKED;
++
++void buffer_trace(struct buffer_head *dest,
++		struct buffer_head *src, char *info)
++{
++	struct buffer_history_item *bhist_i;
++	unsigned long flags;
++
++	if (dest == 0 || src == 0)
++		return;
++
++	spin_lock_irqsave(&trace_lock, flags);
++
++	/*
++	 * Sometimes we don't initialise the ring pointers. (locally declared
++	 * temp buffer_heads). Feebly attempt to detect and correct that here.
++	 */
++	if ((dest->b_history.b_history_head - dest->b_history.b_history_tail >
++				BUFFER_HISTORY_SIZE)) {
++		dest->b_history.b_history_head = 0;
++		dest->b_history.b_history_tail = 0;
++	}
++	bhist_i = dest->b_history.b +
++		(dest->b_history.b_history_head & (BUFFER_HISTORY_SIZE - 1));
++	bhist_i->info = info;
++	bhist_i->b_state = src->b_state;
++	bhist_i->b_list = src->b_list;
++#if defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE)
++	bhist_i->b_trans_is_running = 0;
++	bhist_i->b_trans_is_committing = 0;
++	bhist_i->b_blocknr = src->b_blocknr;
++	if (buffer_jbd(src)) {
++		struct journal_head *jh;
++		journal_t *journal;
++		transaction_t *transaction;
++
++		/* Footwork to avoid racing with journal_remove_journal_head */
++		jh = src->b_private;
++		if (jh == 0)
++			goto raced;
++		transaction = jh->b_transaction;
++		if (src->b_private == 0)
++			goto raced;
++		bhist_i->b_jcount = jh->b_jcount;
++		bhist_i->b_jbd = 1;
++		bhist_i->b_jlist = jh->b_jlist;
++		bhist_i->b_frozen_data = jh->b_frozen_data;
++		bhist_i->b_committed_data = jh->b_committed_data;
++		bhist_i->b_transaction = !!jh->b_transaction;
++		bhist_i->b_next_transaction = !!jh->b_next_transaction;
++		bhist_i->b_cp_transaction = !!jh->b_cp_transaction;
++
++		if (transaction) {
++			journal = transaction->t_journal;
++			bhist_i->b_trans_is_running = transaction ==
++					journal->j_running_transaction;
++			bhist_i->b_trans_is_committing = transaction ==
++					journal->j_committing_transaction;
++		}
++	} else {
++raced:
++		bhist_i->b_jcount = 0;
++		bhist_i->b_jbd = 0;
++		bhist_i->b_jlist = 0;
++		bhist_i->b_frozen_data = 0;
++		bhist_i->b_committed_data = 0;
++		bhist_i->b_transaction = 0;
++		bhist_i->b_next_transaction = 0;
++		bhist_i->b_cp_transaction = 0;
++	}
++#endif	/* defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE) */
++
++	bhist_i->on_lru = (src->b_prev_free != 0 && src->b_next_free != 0);
++	bhist_i->on_hash = (src->b_pprev != 0);
++	bhist_i->cpu = smp_processor_id();
++	bhist_i->b_count = atomic_read(&src->b_count);
++
++	dest->b_history.b_history_head++;
++	if (dest->b_history.b_history_head - dest->b_history.b_history_tail >
++				BUFFER_HISTORY_SIZE)
++		dest->b_history.b_history_tail =
++			dest->b_history.b_history_head - BUFFER_HISTORY_SIZE;
++
++	spin_unlock_irqrestore(&trace_lock, flags);
++}
++
++static const char *b_list_to_string(unsigned int b_list)
++{
++	switch (b_list) {
++	case BUF_CLEAN:		return "BUF_CLEAN";
++	case BUF_LOCKED:	return "BUF_LOCKED";
++	case BUF_DIRTY:		return "BUF_DIRTY";
++	default:		return "Bad b_list";
++	}
++}
++
++static const char *b_jlist_to_string(unsigned int b_list)
++{
++	switch (b_list) {
++#if defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE)
++	case BJ_None:		return "BJ_None";
++	case BJ_SyncData:	return "BJ_SyncData";
++	case BJ_AsyncData:	return "BJ_AsyncData";
++	case BJ_Metadata:	return "BJ_Metadata";
++	case BJ_Forget:		return "BJ_Forget";
++	case BJ_IO:		return "BJ_IO";
++	case BJ_Shadow:		return "BJ_Shadow";
++	case BJ_LogCtl:		return "BJ_LogCtl";
++	case BJ_Reserved:	return "BJ_Reserved";
++#endif
++	default:		return "Bad b_jlist";
++	}
++}
++
++static void print_one_hist(struct buffer_history_item *bhist_i)
++{
++	printk(" %s\n", bhist_i->info);
++	printk("     b_state:0x%lx b_list:%s b_jlist:%s on_lru:%d\n",
++			bhist_i->b_state,
++			b_list_to_string(bhist_i->b_list),
++			b_jlist_to_string(bhist_i->b_jlist),
++			bhist_i->on_lru);
++	printk("     cpu:%d on_hash:%d b_count:%d b_blocknr:%lu\n",
++			bhist_i->cpu,
++			bhist_i->on_hash,
++			bhist_i->b_count,
++			bhist_i->b_blocknr);
++#if defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE)
++	printk("     b_jbd:%u b_frozen_data:%p b_committed_data:%p\n",
++			bhist_i->b_jbd,
++			bhist_i->b_frozen_data,
++			bhist_i->b_committed_data);
++	printk("     b_transaction:%u b_next_transaction:%u "
++			"b_cp_transaction:%u b_trans_is_running:%u\n",
++			bhist_i->b_transaction,
++			bhist_i->b_next_transaction,
++			bhist_i->b_cp_transaction,
++			bhist_i->b_trans_is_running);
++	printk("     b_trans_is_comitting:%u b_jcount:%u ",
++			bhist_i->b_trans_is_committing,
++			bhist_i->b_jcount);
++#endif
++	printk("\n");
++}
++
++void print_buffer_fields(struct buffer_head *bh)
++{
++	printk("b_next:%p, b_blocknr:%lu b_count:%d b_flushtime:%lu\n",
++		bh->b_next, bh->b_blocknr, atomic_read(&bh->b_count),
++			bh->b_flushtime);
++	printk("b_next_free:%p b_prev_free:%p b_this_page:%p b_reqnext:%p\n",
++		bh->b_next_free, bh->b_prev_free, bh->b_this_page,
++			bh->b_reqnext);
++	printk("b_pprev:%p b_data:%p b_page:%p b_inode:%p b_list:%d\n",
++		bh->b_pprev, bh->b_data, bh->b_page, bh->b_inode, bh->b_list);
++#if defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE)
++	if (buffer_jbd(bh)) {
++		struct journal_head *jh = bh2jh(bh);
++
++		printk("b_jlist:%u b_frozen_data:%p b_committed_data:%p\n",
++			jh->b_jlist, jh->b_frozen_data, jh->b_committed_data);
++		printk(" b_transaction:%p b_next_transaction:%p "
++				"b_cp_transaction:%p\n",
++			jh->b_transaction, jh->b_next_transaction,
++			jh->b_cp_transaction);
++		printk("b_cpnext:%p b_cpprev:%p\n",
++			jh->b_cpnext, jh->b_cpprev);
++	}
++#endif
++}
++
++void print_buffer_trace(struct buffer_head *bh)
++{
++#ifdef CONFIG_X86
++	extern void show_stack(unsigned long * esp);
++#endif
++
++	unsigned long idx, count;
++	unsigned long flags;
++
++	printk("buffer trace for buffer at 0x%p (I am CPU %d)\n",
++			bh, smp_processor_id());
++	BUFFER_TRACE(bh, "");		/* Record state now */
++
++	spin_lock_irqsave(&trace_lock, flags);
++	for (	idx = bh->b_history.b_history_tail, count = 0;
++		idx < bh->b_history.b_history_head &&
++			count < BUFFER_HISTORY_SIZE;
++		idx++, count++)
++		print_one_hist(bh->b_history.b +
++			(idx & (BUFFER_HISTORY_SIZE - 1)));
++
++	print_buffer_fields(bh);
++	spin_unlock_irqrestore(&trace_lock, flags);
++#ifdef CONFIG_X86
++	show_stack(NULL);
++#endif
++	printk("\n");
++}
++
++static struct buffer_head *failed_buffer_head;	/* For access with debuggers */
++
++void buffer_assertion_failure(struct buffer_head *bh)
++{
++	failed_buffer_head = bh;
++	print_buffer_trace(bh);
++}
++EXPORT_SYMBOL(buffer_trace);
++EXPORT_SYMBOL(print_buffer_trace);
++EXPORT_SYMBOL(buffer_assertion_failure);
++EXPORT_SYMBOL(print_buffer_fields);
++#endif	/* CONFIG_BUFFER_DEBUG */
++
+diff -puN fs/Makefile~ext3-debug fs/Makefile
+--- 24/fs/Makefile~ext3-debug	2003-05-14 13:38:14.000000000 -0700
++++ 24-akpm/fs/Makefile	2003-05-14 13:38:14.000000000 -0700
+@@ -7,14 +7,14 @@
+ 
+ O_TARGET := fs.o
+ 
+-export-objs :=	filesystems.o open.o dcache.o buffer.o
++export-objs :=	filesystems.o open.o dcache.o buffer.o jbd-kernel.o
+ mod-subdirs :=	nls
+ 
+ obj-y :=	open.o read_write.o devices.o file_table.o buffer.o \
+ 		super.o block_dev.o char_dev.o stat.o exec.o pipe.o namei.o \
+ 		fcntl.o ioctl.o readdir.o select.o fifo.o locks.o \
+ 		dcache.o inode.o attr.o bad_inode.o file.o iobuf.o dnotify.o \
+-		filesystems.o namespace.o seq_file.o xattr.o
++		filesystems.o namespace.o seq_file.o xattr.o jbd-kernel.o
+ 
+ ifeq ($(CONFIG_QUOTA),y)
+ obj-y += dquot.o
+diff -puN /dev/null include/linux/buffer-trace.h
+--- /dev/null	2002-08-30 16:31:37.000000000 -0700
++++ 24-akpm/include/linux/buffer-trace.h	2003-05-14 13:38:14.000000000 -0700
+@@ -0,0 +1,84 @@
++/*
++ * include/linux/buffer-trace.h
++ *
++ * Debugging support for recording buffer_head state transitions
++ *
++ * May 2001, akpm
++ *	Created
++ */
++
++#ifndef BUFFER_TRACE_H_INCLUDED
++#define BUFFER_TRACE_H_INCLUDED
++
++#include <linux/config.h>
++
++#ifdef CONFIG_BUFFER_DEBUG
++
++/* The number of records per buffer_head.  Must be a power of two */
++#define BUFFER_HISTORY_SIZE	32
++
++struct buffer_head;
++
++/* This gets embedded in struct buffer_head */
++struct buffer_history {
++	struct buffer_history_item {
++		char *info;
++		unsigned long b_state;
++		unsigned b_list:3;
++		unsigned b_jlist:4;
++		unsigned on_lru:1;
++		unsigned on_hash:1;
++		unsigned cpu:3;
++		unsigned b_count:8;
++		unsigned long b_blocknr;	/* For src != dest */
++#if defined(CONFIG_JBD) || defined(CONFIG_JBD_MODULE)
++		unsigned b_jcount:4;
++		unsigned b_jbd:1;
++		unsigned b_transaction:1;
++		unsigned b_next_transaction:1;
++		unsigned b_cp_transaction:1;
++		unsigned b_trans_is_running:1;
++		unsigned b_trans_is_committing:1;
++		void *b_frozen_data;
++		void *b_committed_data;
++#endif
++	} b[BUFFER_HISTORY_SIZE];
++	unsigned long b_history_head;	/* Next place to write */
++	unsigned long b_history_tail;	/* Oldest valid entry */
++};
++
++static inline void buffer_trace_init(struct buffer_history *bhist)
++{
++	bhist->b_history_head = 0;
++	bhist->b_history_tail = 0;
++}
++extern void buffer_trace(struct buffer_head *dest,
++			struct buffer_head *src, char *info);
++extern void print_buffer_fields(struct buffer_head *bh);
++extern void print_buffer_trace(struct buffer_head *bh);
++
++#define BUFFER_STRINGIFY2(X)		#X
++#define BUFFER_STRINGIFY(X)		BUFFER_STRINGIFY2(X)
++
++#define BUFFER_TRACE2(dest, src, info)				\
++	do {							\
++		buffer_trace((dest), (src),			\
++			__FUNCTION__"() ["__FILE__":"		\
++			BUFFER_STRINGIFY(__LINE__)"] " info);	\
++	} while (0)
++
++#define BUFFER_TRACE(bh, info) BUFFER_TRACE2(bh, bh, info)
++#define JBUFFER_TRACE(jh, info)	BUFFER_TRACE(jh2bh(jh), info)
++
++#else		/* CONFIG_BUFFER_DEBUG */
++
++#define buffer_trace_init(bh)	do {} while (0)
++#define print_buffer_fields(bh)	do {} while (0)
++#define print_buffer_trace(bh)	do {} while (0)
++#define BUFFER_TRACE(bh, info)	do {} while (0)
++#define BUFFER_TRACE2(bh, bh2, info)	do {} while (0)
++#define JBUFFER_TRACE(jh, info)	do {} while (0)
++
++#endif		/* CONFIG_BUFFER_DEBUG */
++
++#endif		/* BUFFER_TRACE_H_INCLUDED */
+diff -puN include/linux/fs.h~ext3-debug include/linux/fs.h
+--- 24/include/linux/fs.h~ext3-debug	2003-05-14 13:38:14.000000000 -0700
++++ 24-akpm/include/linux/fs.h	2003-05-14 13:38:14.000000000 -0700
+@@ -21,6 +21,7 @@
+ #include <linux/cache.h>
+ #include <linux/stddef.h>
+ #include <linux/string.h>
++#include <linux/buffer-trace.h>
+ 
+ #include <asm/atomic.h>
+ #include <asm/bitops.h>
+@@ -268,6 +269,10 @@ struct buffer_head {
+ 	wait_queue_head_t b_wait;
+ 
+ 	struct list_head     b_inode_buffers;	/* doubly linked list of inode dirty buffers */
++
++#ifdef CONFIG_BUFFER_DEBUG
++	struct buffer_history b_history;
++#endif
+ };
+ 
+ typedef void (bh_end_io_t)(struct buffer_head *bh, int uptodate);
+@@ -1168,6 +1173,10 @@ static inline void __mark_buffer_clean(s
+ 
+ static inline void mark_buffer_clean(struct buffer_head * bh)
+ {
++#if defined(CONFIG_JBD_DEBUG)
++	extern void jbd_preclean_buffer_check(struct buffer_head *);
++	jbd_preclean_buffer_check(bh); /* @@@ Expensive debugging */
++#endif
+ 	if (atomic_set_buffer_clean(bh))
+ 		__mark_buffer_clean(bh);
+ }
+diff -puN include/linux/jbd.h~ext3-debug include/linux/jbd.h
+--- 24/include/linux/jbd.h~ext3-debug	2003-05-14 13:38:14.000000000 -0700
++++ 24-akpm/include/linux/jbd.h	2003-05-14 13:38:14.000000000 -0700
+@@ -56,7 +56,9 @@
+  * CONFIG_JBD_DEBUG is on.
+  */
+ #define JBD_EXPENSIVE_CHECKING
++
+ extern int journal_enable_debug;
++extern int journal_no_write[2];
+ 
+ #define jbd_debug(n, f, a...)						\
+ 	do {								\
+@@ -929,6 +931,8 @@ extern int journal_blocks_per_page(struc
+  * Definitions which augment the buffer_head layer
+  */
+ 
++/* JBD additions */ 
++
+ /* journaling buffer types */
+ #define BJ_None		0	/* Not journaled */
+ #define BJ_SyncData	1	/* Normal data: flush before commit */
+@@ -994,13 +998,6 @@ static inline int buffer_jbd_data(struct
+ #define assert_spin_locked(lock)	do {} while(0)
+ #endif
+ 
+-#define buffer_trace_init(bh)	do {} while (0)
+-#define print_buffer_fields(bh)	do {} while (0)
+-#define print_buffer_trace(bh)	do {} while (0)
+-#define BUFFER_TRACE(bh, info)	do {} while (0)
+-#define BUFFER_TRACE2(bh, bh2, info)	do {} while (0)
+-#define JBUFFER_TRACE(jh, info)	do {} while (0)
+-
+ #endif	/* __KERNEL__ */
+ 
+ #endif	/* CONFIG_JBD || CONFIG_JBD_MODULE || !__KERNEL__ */
+
+_
